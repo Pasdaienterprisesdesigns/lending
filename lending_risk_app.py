@@ -1,92 +1,98 @@
 import os
 from datetime import datetime, timedelta
-import requests
 import pandas as pd
 import streamlit as st
+import plotly.express as px
+from web3 import Web3
 
 # ─── CONFIG ─────────────────────────────────────────────────────────────────────
-SIM_API_KEY = os.getenv("SIM_API_KEY") or "sim_444cGnNxG0exoklzAjwNsmIGcv03PBDG"
-SIM_BASE    = "https://api.sim.dune.com/v1/evm"
-HEADERS     = {"X-Sim-Api-Key": SIM_API_KEY}
+RPC_URL       = os.getenv("ETH_RPC_URL") or "https://mainnet.infura.io/v3/YOUR_INFURA_KEY"
+WEB3_HTTP     = Web3(Web3.HTTPProvider(RPC_URL))
+WEB3_WS       = Web3(Web3.WebsocketProvider(RPC_URL.replace('https','wss')))
+HIST_DAYS     = 30
+BLOCK_TIME_S  = 12  # average block time in seconds
+BLOCKS_PER_HR = int(3600 / BLOCK_TIME_S)
+HOURS_30D     = HIST_DAYS * 24
 
-# ─── HELPERS ────────────────────────────────────────────────────────────────────
-def fetch_gas_data(start: datetime, end: datetime, limit: int = 500) -> pd.DataFrame:
+st.set_page_config(page_title="Gas‐Fee ML Explorer", layout="centered")
+st.title("🔮 Gas-Fee Time-of-Day & 10-Minute Forecast")
+
+@st.cache_data(ttl=3600)
+def fetch_30d_hourly():
     """
-    Fetch transactions between start and end, return DataFrame with gas price (gwei) indexed by timestamp.
+    Backfill last 30 days hourly baseFeePerGas via JSON-RPC.
     """
+    latest_block = WEB3_HTTP.eth.block_number
     rows = []
-    params = {
-        "limit": limit,
-        "since": start.isoformat() + "Z",
-        "until": end.isoformat() + "Z"
-    }
-    offset = None
-    while True:
-        if offset:
-            params["offset"] = offset
-        resp = requests.get(
-            f"{SIM_BASE}/transactions/0x0000000000000000000000000000000000000000",
-            headers=HEADERS,
-            params=params,
-            timeout=30
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        txs = data.get("transactions", [])
-        for t in txs:
-            gp_hex = t.get("gas_price") or t.get("max_fee_per_gas")
-            if not gp_hex:
-                continue
-            gp = int(gp_hex, 16) / 1e9
-            rows.append({"ts": pd.to_datetime(t["block_time"]), "gas": gp})
-        offset = data.get("next_offset")
-        if not offset or len(txs) < limit:
+    for i in range(HOURS_30D):
+        blk_num = latest_block - i * BLOCKS_PER_HR
+        if blk_num < 0:
             break
-    df = pd.DataFrame(rows).set_index("ts").sort_index()
-    return df
+        bl = WEB3_HTTP.eth.get_block(blk_num)
+        ts = datetime.utcfromtimestamp(bl.timestamp)
+        # baseFeePerGas is in wei
+        base_fee = bl.baseFeePerGas / 1e9  # gwei
+        rows.append({"dt": ts, "baseFee": base_fee})
+    df = pd.DataFrame(rows)
+    df.set_index('dt', inplace=True)
+    return df.sort_index()
 
-# ─── FORECASTS ─────────────────────────────────────────────────────────────────
-def compute_forecasts(df: pd.DataFrame):
+@st.cache_data(ttl=300)
+def fetch_10min_history():
     """
-    Given raw gas series, resample into 10-min bins and compute:
-      - Next 10-min forecast (30th percentile over past 6h)
-      - Next 6h forecast (30th percentile over past 36h)
+    Fetch last 10 minutes of blocks and compute 30th percentile baseFee.
     """
-    s10 = df["gas"].resample("10min").mean().dropna()
-    forecast_10min = s10.rolling(window=36).quantile(0.3).iloc[-1]
-    forecast_6h = s10.rolling(window=36 * 6).quantile(0.3).iloc[-1]
-    return s10, forecast_10min, forecast_6h
+    block_count = int((10 * 60) / BLOCK_TIME_S)
+    fh = WEB3_HTTP.eth.fee_history(
+        block_count=block_count,
+        newest_block='latest',
+        reward_percentiles=[]
+    )
+    # skip the first entry (oldest), use the rest
+    raw_fees = fh['baseFeePerGas'][1:]
+    gwei = [b / 1e9 for b in raw_fees]
+    return pd.Series(gwei).quantile(0.3)
 
-# ─── TIME-OF-DAY ANALYSIS ───────────────────────────────────────────────────────
-def cheapest_time_of_day(df: pd.DataFrame):
-    """
-    Over the last month, find the hour of day (0-23 UTC) with the lowest average gas price.
-    """
-    s_hour = df["gas"].resample("1h").mean().dropna()
-    hourly = s_hour.groupby(s_hour.index.hour).mean().sort_index()
-    best_hour = int(hourly.idxmin())
-    avg_price = float(hourly.min())
-    return best_hour, avg_price, hourly
+# ─── MAIN ───────────────────────────────────────────────────────────────────────
+# 1) Load 30-day hourly history
+df_30d = fetch_30d_hourly()
 
-# ─── STREAMLIT UI ─────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Gas Fee Forecast & Optimizer", layout="centered")
-st.title("⛽ Gas Fee Forecast & Optimizer")
+# 2) Compute time-of-day stats
+hourly_avg = df_30d['baseFee'].groupby(df_30d.index.hour).mean()
+best_hour = int(hourly_avg.idxmin())
+avg_price = float(hourly_avg.min())
 
-if st.button("Run Forecast"):
-    now = datetime.utcnow()
-    # fetch last 6h for reliable 10-min forecasts
-    df_recent = fetch_gas_data(now - timedelta(hours=6), now)
-    # fetch last 30d for hourly-of-day analysis
-    df_month = fetch_gas_data(now - timedelta(days=30), now)
+# 3) Train a simple regression model
+from sklearn.ensemble import RandomForestRegressor
+# Feature engineer
+df_30d['hour'] = df_30d.index.hour
+df_30d['dow']  = df_30d.index.dayofweek
+X = df_30d[['hour','dow']]
+y = df_30d['baseFee']
+model = RandomForestRegressor(n_estimators=100)
+model.fit(X, y)
 
-    _, f10, f6 = compute_forecasts(df_recent)
-    st.metric("Next 10-min forecast (30th pct)", f"{f10:.2f} gwei")
-    st.metric("Next 6h forecast (30th pct)", f"{f6:.2f} gwei")
+# 4) Predict next 10-min
+now = datetime.utcnow()
+feat = pd.DataFrame([{'hour': now.hour, 'dow': now.weekday()}])
+pred_10 = model.predict(feat)[0]
+# override with direct 30th percentile if desired
+pct30_10 = fetch_10min_history()
 
-    best_hr, avg_p, hourly = cheapest_time_of_day(df_month)
-    st.write(f"Cheapest hour in last 30d: **{best_hr}:00 UTC**, avg {avg_p:.2f} gwei")
+# ─── STREAMLIT OUTPUT ─────────────────────────────────────────────────────────
+col1, col2 = st.columns(2)
+col1.metric("Cheapest Hour (Last 30d)", f"{best_hour:02d}:00 UTC", delta=f"{avg_price:.2f} gwei")
+col2.metric("10-min Forecast (ML)", f"{pred_10:.2f} gwei", delta=f"30th pct: {pct30_10:.2f} gwei")
 
-    st.subheader("Hourly Average Gas Price (Last 30 Days)")
-    st.bar_chart(hourly)
-else:
-    st.write("Click **Run Forecast** to compute gas predictions and view hourly averages.")
+st.subheader("Hourly Average BaseFee (Last 30 Days)")
+fig = px.bar(
+    x=hourly_avg.index,
+    y=hourly_avg.values,
+    labels={'x':'Hour (UTC)','y':'Avg BaseFee (gwei)'},
+    title='Avg Gas Price by Hour of Day'
+)
+st.plotly_chart(fig, use_container_width=True)
+
+st.subheader("30-Day BaseFee Time Series")
+fig2 = px.line(df_30d, y='baseFee', labels={'dt':'Date','baseFee':'BaseFee (gwei)'})
+st.plotly_chart(fig2, use_container_width=True)
