@@ -1,154 +1,94 @@
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta
 import requests
 import pandas as pd
 import streamlit as st
-from sklearn.ensemble import IsolationForest
 
-# ─── Optional Auto-Refresh ────────────────────────────────────────────────────
-try:
-    from streamlit_autorefresh import st_autorefresh  # type: ignore
-    HAS_AUTOREFRESH = True
-except ImportError:
-    HAS_AUTOREFRESH = False
+# ─── CONFIG ─────────────────────────────────────────────────────────────────────
+SIM_API_KEY = os.getenv("SIM_API_KEY") or "sim_444cGnNxG0exoklzAjwNsmIGcv03PBDG"
+SIM_BASE    = "https://api.sim.dune.com/v1/evm"
+HEADERS     = {"X-Sim-Api-Key": SIM_API_KEY}
 
-# ─── Configuration ─────────────────────────────────────────────────────────────
-SIM_API_KEY    = os.getenv("SIM_API_KEY") or "sim_444cGnNxG0exoklzAjwNsmIGcv03PBDG"
-if not SIM_API_KEY:
-    st.error("Please set the SIM_API_KEY environment variable.")
-    st.stop()
+# ─── HELPERS ────────────────────────────────────────────────────────────────────
+def fetch_gas_data(start: datetime, end: datetime, limit: int = 500) -> pd.DataFrame:
+    """
+    Fetch transactions between start and end, return DataFrame with datetime index and gas price in gwei.
+    """
+    rows = []
+    params = {
+        "limit": limit,
+        "since": start.isoformat() + "Z",
+        "until": end.isoformat() + "Z"
+    }
+    offset = None
+    while True:
+        if offset:
+            params["offset"] = offset
+        resp = requests.get(
+            f"{SIM_BASE}/transactions/0x0000000000000000000000000000000000000000",
+            headers=HEADERS,
+            params=params,
+            timeout=30
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        txs = data.get("transactions", [])
+        for t in txs:
+            # convert hex gas_price or max_fee_per_gas to decimal gwei
+            gp_hex = t.get("gas_price") or t.get("max_fee_per_gas")
+            if gp_hex:
+                gp_gwei = int(gp_hex, 16) / 1e9
+                rows.append({"ts": pd.to_datetime(t["block_time"]), "gas": gp_gwei})
+        offset = data.get("next_offset")
+        if not offset or len(txs) < limit:
+            break
+    df = pd.DataFrame(rows).set_index("ts").sort_index()
+    return df
 
-API_BASE       = "https://api.sim.dune.com/v1/evm"
-HEADERS        = {"X-Sim-Api-Key": SIM_API_KEY, "Content-Type": "application/json"}
-PLATFORMS      = ["aave", "compound"]
-CHAIN_ID       = 1  # 1 = Ethereum Mainnet; change as needed for other EVM chains
-WINDOW_MINUTES = 1
-REFRESH_MS     = 60_000
-CONTAMINATION  = 0.01
+# ─── FORECASTS ─────────────────────────────────────────────────────────────────
+def compute_forecasts(df: pd.DataFrame):
+    """
+    Given a DataFrame with 10-min resampled gas, compute:
+    - next 10-min bin forecast (30th pct of past 36 bins ~6h)
+    - next 6-hour forecast (30th pct of past 36*6 bins ~36h)
+    """
+    s10 = df["gas"].resample("10min").mean().dropna()
+    # 10-min forecast uses last 36 bins (~6h history)
+    forecast_10min = s10.rolling(window=36).quantile(0.3).iloc[-1]
+    # 6-hour forecast uses last 36*6 bins (~36h history)
+    forecast_6h = s10.rolling(window=36*6).quantile(0.3).iloc[-1]
+    return s10, forecast_10min, forecast_6h
 
-# ─── Auto-refresh setup ─────────────────────────────────────────────────────────
-if HAS_AUTOREFRESH:
-    st_autorefresh(interval=REFRESH_MS, key="auto_refresh")
+# ─── TIME-OF-DAY ANALYSIS ───────────────────────────────────────────────────────
+def cheapest_time_of_day(df: pd.DataFrame):
+    """
+    Over last month, find which hour of day has lowest average gas.
+    """
+    s_hour = df["gas"].resample("1h").mean().dropna()
+    # group by hour of day
+    hourly = s_hour.groupby(s_hour.index.hour).mean()
+    best_hour = int(hourly.idxmin())
+    avg_price = float(hourly.min())
+    return best_hour, avg_price, hourly
 
-st.set_page_config(page_title="💰 DeFi Lending Risk Analyzer", layout="wide")
-st.title("💰 DeFi Lending Risk Analyzer")
+# ─── STREAMLIT UI ─────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Gas Fee Forecast & Optimizer", layout="centered")
+st.title("⛽ Gas-Fee Forecast & Optimizer")
 
-wallet = st.text_input("Wallet address (0x...)", "")
-if not wallet:
-    st.info("Enter an Ethereum wallet to analyze.")
-    st.stop()
+if st.button("Run Forecast"):
+    now = datetime.utcnow()
+    # 10-min and 6h historical windows
+    df_2h = fetch_gas_data(now - timedelta(hours=2), now)
+    df_1mo = fetch_gas_data(now - timedelta(days=30), now)
 
-# ─── Fetching helpers ───────────────────────────────────────────────────────────
-@st.cache_data(ttl=300)
-def fetch_lending_positions(wallet: str) -> pd.DataFrame:
-    dfs = []
-    for proto in PLATFORMS:
-        url = f"{API_BASE}/lending-positions/{wallet}"
-        params = {"protocol": proto, "chain_id": CHAIN_ID}
-        r = requests.get(url, headers=HEADERS, params=params, timeout=10)
-        if r.status_code != 200:
-            continue
-        df = pd.DataFrame(r.json().get("positions", []))
-        if not df.empty:
-            df["platform"] = proto
-            dfs.append(df)
-    return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+    _, f10, f6 = compute_forecasts(df_2h)
+    st.metric("Next 10-min forecast (30th pct)", f"{f10:.2f} gwei")
+    st.metric("Next 6h forecast (30th pct)", f"{f6:.2f} gwei")
 
-@st.cache_data(ttl=300)
-def fetch_prices(addresses: list[str]) -> dict[str, float]:
-    body = {"addresses": addresses, "chain_id": CHAIN_ID}
-    r = requests.post(f"{API_BASE}/token-info", json=body, headers=HEADERS, timeout=10)
-    r.raise_for_status()
-    data = r.json().get("data", [])
-    return {item["address"].lower(): float(item.get("price_usd") or 0) for item in data}
+    best_hr, avg_p, hourly = cheapest_time_of_day(df_1mo)
+    st.write(f"Cheapest hour of day in last 30d: **{best_hr}:00 UTC**, avg {avg_p:.2f} gwei")
 
-# ─── Data retrieval ─────────────────────────────────────────────────────────────
-pos = fetch_lending_positions(wallet)
-if pos.empty:
-    st.error("No lending positions found for this wallet.")
-    st.stop()
-
-# ─── Dynamic column detection ───────────────────────────────────────────────────
-def find_col(cols, *keywords):
-    for c in cols:
-        if all(kw.lower() in c.lower() for kw in keywords):
-            return c
-    return None
-
-token_col   = find_col(pos.columns, "token", "address")
-coll_col    = find_col(pos.columns, "collateral", "balance")
-borrow_col  = find_col(pos.columns, "borrowed", "balance")
-dec_col     = find_col(pos.columns, "decimals")
-thresh_col  = find_col(pos.columns, "liquidation", "threshold")
-
-required = {
-    "token_address": token_col,
-    "collateral_balance": coll_col,
-    "borrowed_balance": borrow_col,
-    "decimals": dec_col,
-    "liquidation_threshold": thresh_col
-}
-missing = [name for name, col in required.items() if col is None]
-if missing:
-    st.error(f"Could not find columns: {missing}")
-    st.stop()
-
-# ─── Price fetching ─────────────────────────────────────────────────────────────
-addrs = pos[token_col].str.lower().unique().tolist()
-prices = fetch_prices(addrs)
-
-# ─── Compute USD metrics ────────────────────────────────────────────────────────
-pos["decimals"]       = pos[dec_col].astype(int)
-pos["collateral_amt"] = pos[coll_col].astype(float) / (10 ** pos["decimals"])
-pos["borrowed_amt"]   = pos[borrow_col].astype(float)   / (10 ** pos["decimals"])
-pos["price_usd"]      = pos[token_col].str.lower().map(prices).fillna(0.0)
-pos["collateral_usd"] = pos["collateral_amt"] * pos["price_usd"]
-pos["borrowed_usd"]   = pos["borrowed_amt"]   * pos["price_usd"]
-
-# ─── Aggregate per protocol ────────────────────────────────────────────────────
-protocol_metrics = (
-    pos.groupby("platform")
-       .agg(total_collateral=("collateral_usd", "sum"),
-            total_borrowed=("borrowed_usd",   "sum"))
-)
-protocol_metrics["coll_ratio"] = protocol_metrics["total_collateral"] / protocol_metrics["total_borrowed"]
-protocol_metrics["health_factor"] = (
-    protocol_metrics["coll_ratio"] /
-    pos.groupby("platform")[thresh_col].first().astype(float)
-)
-
-# ─── Portfolio health factor ───────────────────────────────────────────────────
-portfolio_hf = protocol_metrics["health_factor"].min()
-
-# ─── Track history ─────────────────────────────────────────────────────────────
-now = datetime.now(timezone.utc)
-if "history" not in st.session_state:
-    st.session_state.history = pd.DataFrame(columns=["timestamp", "portfolio_hf"])
-hist = st.session_state.history
-new = pd.DataFrame([{"timestamp": now, "portfolio_hf": portfolio_hf}])
-hist = pd.concat([hist, new], ignore_index=True).drop_duplicates("timestamp")
-st.session_state.history = hist
-
-# ─── Display metrics ───────────────────────────────────────────────────────────
-c1, c2 = st.columns(2)
-c1.metric("Portfolio Health Factor", f"{portfolio_hf:.2f}")
-c2.dataframe(protocol_metrics[["total_collateral","total_borrowed","health_factor"]]
-             .style.format({"total_collateral":"${:,.2f}",
-                            "total_borrowed":"${:,.2f}",
-                            "health_factor":"{:.2f}"}),
-             use_container_width=True)
-
-st.subheader("Historical Portfolio Health Factor")
-st.line_chart(st.session_state.history.set_index("timestamp")["portfolio_hf"])
-
-st.subheader("Position Breakdown")
-pos.rename(columns={
-    token_col: "token_address",
-    coll_col: "collateral_balance",
-    borrow_col: "borrowed_balance",
-    dec_col: "decimals",
-    thresh_col: "liquidation_threshold"
-})[[
-    "platform", "token_address", "collateral_amt", "borrowed_amt",
-    "price_usd", "collateral_usd", "borrowed_usd", "liquidation_threshold"
-]]
+    st.subheader("Hourly average gas (last 30d)")
+    st.line_chart(hourly)
+else:
+    st.write("Click **Run Forecast** to compute gas predictions based on Sim data.")
