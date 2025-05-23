@@ -6,7 +6,7 @@ import plotly.express as px
 from web3 import Web3
 
 # ─── CONFIG ─────────────────────────────────────────────────────────────────────
-RPC_URL       = os.getenv("ETH_RPC_URL") or "https://mainnet.infura.io/v3/YOUR_INFURA_KEY"
+RPC_URL       = "https://mainnet.infura.io/v3/6998b5202d9e41339c5dea660a21412a"
 WEB3_HTTP     = Web3(Web3.HTTPProvider(RPC_URL))
 WEB3_WS       = Web3(Web3.WebsocketProvider(RPC_URL.replace('https','wss')))
 HIST_DAYS     = 30
