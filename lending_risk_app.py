@@ -13,7 +13,7 @@ except ImportError:
     HAS_AUTOREFRESH = False
 
 # ─── Configuration ─────────────────────────────────────────────────────────────
-SIM_API_KEY = "sim_444cGnNxG0exoklzAjwNsmIGcv03PBDG"
+SIM_API_KEY    = os.getenv("SIM_API_KEY") or "sim_444cGnNxG0exoklzAjwNsmIGcv03PBDG"
 if not SIM_API_KEY:
     st.error("Please set the SIM_API_KEY environment variable.")
     st.stop()
@@ -21,6 +21,7 @@ if not SIM_API_KEY:
 API_BASE       = "https://api.sim.dune.com/v1/evm"
 HEADERS        = {"X-Sim-Api-Key": SIM_API_KEY, "Content-Type": "application/json"}
 PLATFORMS      = ["aave", "compound"]
+CHAIN_ID       = 1  # 1 = Ethereum Mainnet; change as needed for other EVM chains
 WINDOW_MINUTES = 1
 REFRESH_MS     = 60_000
 CONTAMINATION  = 0.01
@@ -42,8 +43,9 @@ if not wallet:
 def fetch_lending_positions(wallet: str) -> pd.DataFrame:
     dfs = []
     for proto in PLATFORMS:
-        url = f"{API_BASE}/lending-positions/{wallet}?protocol={proto}"
-        r = requests.get(url, headers=HEADERS, timeout=10)
+        url = f"{API_BASE}/lending-positions/{wallet}"
+        params = {"protocol": proto, "chain_id": CHAIN_ID}
+        r = requests.get(url, headers=HEADERS, params=params, timeout=10)
         if r.status_code != 200:
             continue
         df = pd.DataFrame(r.json().get("positions", []))
@@ -54,7 +56,7 @@ def fetch_lending_positions(wallet: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=300)
 def fetch_prices(addresses: list[str]) -> dict[str, float]:
-    body = {"addresses": addresses}
+    body = {"addresses": addresses, "chain_id": CHAIN_ID}
     r = requests.post(f"{API_BASE}/token-info", json=body, headers=HEADERS, timeout=10)
     r.raise_for_status()
     data = r.json().get("data", [])
