@@ -16,9 +16,10 @@ def get_wallet_balances(address):
     url = f"{BASE_URL}/evm/balances/{address}"
     headers = {"X-Sim-Api-Key": X_SIM_API_KEY}
     res = requests.get(url, headers=headers)
-    if res.status_code != 200:
-        return None, res.text
-    return res.json(), None
+    print("Response status:", res.status_code)
+    print("Response body:", res.text)
+    return res.json(), None if res.status_code == 200 else res.text
+
 
 # ─── DATA PROCESSING ────────────────────────────────────────────────────────────
 def process_balances(data):
